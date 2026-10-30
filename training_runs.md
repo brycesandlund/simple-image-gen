@@ -11,18 +11,20 @@ Experiment ledger for `simple-image-gen`. Dates use America/Los_Angeles. Values 
 | E003 | 2026-10-21 | `runs/cifar10-interpolation` | Uniform noise/image interpolation regression | 1 epoch / 20 independent draws | 7,820 | 357.7 s | Distinct blurry outputs; no uniform-gray collapse |
 | E004 | 2026-10-21 | `runs/cifar10-interpolation-rollout` | E003 checkpoint continued on model-generated states | 1 additional epoch / 20 | 7,820 new | 429.9 s | Gray collapse after first batch; persists through epoch |
 | E005 | 2026-10-21 | `runs/cifar10-categorical` | Categorical CE with sampled recurrent states | 1 epoch / 20 | 7,820 | 929.4 s | Colorful static; no visible spatial structure |
+| E006 | 2026-10-22 | `runs/cifar10-denoising` | Continuous MSE denoising pretraining | 20 epochs / 1 | 7,820 | 384.9 s | Better one-pass denoising; recurrent drift persists |
 | S001 | 2026-10-21 | `runs/smoke` | Baseline mechanics check on 256 images | 1 epoch / 20 | 40 | 3.44 s | Completed; not a quality experiment |
 | S002 | 2026-10-21 | `runs/fixed-progressive-smoke` | Fixed-pair curriculum check on 256 images | 5 epochs / 1, 2, 3, 5, 8 | 38 | 3.97 s | Completed; pairing and coverage checks passed |
 | S003 | 2026-10-21 | `runs/interpolation-smoke` | Interpolation mechanics check on 256 images | 1 epoch / 20 independent draws | 40 | 2.47 s | Completed; interpolation tests passed |
 | S004 | 2026-10-21 | `runs/rollout-finetune-smoke` | Checkpoint continuation on 256 images | 1 epoch / 20 | 40 new | 2.71 s | Exact starting outputs and Adam continuation verified |
 | S005 | 2026-10-21 | `runs/categorical-smoke` | Categorical mechanics on 256 images | 1 epoch / 20 | 40 | 7.00 s | Passed three categorical tests and GPU smoke run |
+| S006 | 2026-10-22 | `runs/denoising-smoke` | Denoising loop on 256 images | 3 epochs / 1 | 6 | 3.16 s | Tests, finite losses, and epoch coverage passed |
 
 ## Shared setup and metric definitions
 
 - **Data:** CIFAR-10 training images, 32×32 RGB, scaled as `uint8 / 127.5 - 1` in regression runs; E005 quantizes to 200 evenly spaced channel values in [-1,1]. Labels are unused. Full experiments use all 50,000 images, shuffled each epoch, without augmentation.
-- **Model:** shared direct-output U-Net, base width 24, 266,547 parameters, SiLU, GroupNorm, and internal spatial skip connections. E001–E003 start from fresh initialization; E004 continues the final E003 weights and Adam state. E005 starts fresh with the same U-Net body and a 600-logit categorical head (281,472 total parameters).
+- **Model:** shared direct-output U-Net, base width 24, 266,547 parameters, SiLU, GroupNorm, and internal spatial skip connections. E001–E003 and E006 start from fresh initialization; E004 continues the final E003 weights and Adam state. E005 starts fresh with the same U-Net body and a 600-logit categorical head (281,472 total parameters).
 - **Optimizer:** Adam, learning rate `1e-4`, betas `(0.9, 0.999)`, epsilon `1e-8`, no weight decay. Batch size 128, including the final batch of 80 on full-data epochs.
-- **Training:** MSE averaged over batch, channels, and pixels, with one optimizer update per supervised minibatch. In recurrent runs E001/E002/E004, the pre-update forward output is detached and carried to the next transition, without recomputation or rollout backpropagation. E003 instead samples each training input independently from an image/noise interpolation. E005 uses cross-entropy and carries detached samples from categorical output distributions.
+- **Training:** MSE averaged over batch, channels, and pixels, with one optimizer update per supervised minibatch. In recurrent runs E001/E002/E004, the pre-update forward output is detached and carried to the next transition, without recomputation or rollout backpropagation. E003 instead samples each training input independently from an image/noise interpolation. E005 uses cross-entropy and carries detached samples from categorical output distributions. E006 performs one MSE update per minibatch on freshly pixel-corrupted targets, interleaved over 20 epochs; recurrence is evaluation-only.
 - **Excluded features:** no time/class conditioning, output residual connection, additive intermediate noise injection, output clipping, dropout, gradient clipping, or learning-rate schedule.
 - **Seeds/runtime:** model and shuffle seed 42; unseen evaluation noise seed 1042; PyTorch 2.14.1; Apple Metal (`mps`) on an M5 Pro.
 - **Evaluation:** frozen weights, no target-dependent updates, 64 unseen noise samples reused across checkpoints. Metrics use raw tensors; PNG rendering alone clips to [-1,1].
@@ -218,6 +220,47 @@ uv run python test_categorical.py
 
 **Saved evidence:** [config](runs/cifar10-categorical/config.json), [summary](runs/cifar10-categorical/summary.json), [training losses](runs/cifar10-categorical/training.csv), [evaluations](runs/cifar10-categorical/evaluation.jsonl), [histogram samples](runs/cifar10-categorical/histogram_control.png), [rollout](runs/cifar10-categorical/trajectory_final.png), [final checkpoint](runs/cifar10-categorical/checkpoint_seen_50000.pt), [source snapshot](runs/cifar10-categorical/train_categorical.py).
 
+## E006 — Continuous MSE denoising pretraining
+
+**Setup:** fresh width-24, 266,547-parameter U-Net with continuous RGB output. Train 20 shuffled CIFAR-10 epochs with one Adam update per minibatch. Each image gets a fresh corruption fraction `r ~ Uniform[0,1]`; independently replace each entire RGB pixel at that rate. Replacement channels come from full-training-set per-position 256-value empirical histograms (no new quantization). MSE targets are the clean images scaled to [-1,1]. The mask and fraction are hidden from the model. No recurrence or model-generated training inputs during this stage.
+
+**Budget:** one million image visits, 7,820 updates, batch 128 with final 80 in every epoch; Adam 1e-4, seed 42. Same model and update budget as E003, but corruption and interleaving both changed, so this is not an isolated test of either change. No on-policy stage was run.
+
+**Evaluation:** fixed first 64 CIFAR-10 test images and replacement draws/masks at fractions 0, .2, .5, .8, .95, 1. Evaluate one-pass reconstruction and frozen repeated applications through step 20. Also evaluate 64 fixed histogram initial states, seed 1042. Save epoch 1/5/10/15/20 checkpoints and raw evaluation tensors. Report replaced/retained pixel errors to distinguish repair from copying. At r=1, paired-target MSE is not an unconditional generation-quality score.
+
+**Result:** One-pass denoising improves over training: at 80% replacement, held-out MSE falls from 0.08973 at epoch 1 to 0.07149 at epoch 20; at 20% replacement it falls from 0.02940 to 0.01199. Final reconstructions retain recognizable image content and restore many corrupted pixels, though heavy corruption remains blurry. Repeated frozen applications still drift and oversaturate. At 80% replacement, final-model MSE rises from 0.07149 after one pass to 0.42205 after 20; even clean starts reach 0.42774 at step 20. Rollout stability is not monotonic in training: epoch 15 had lower 80%-replacement step-20 error (0.25489). Pure histogram starts form distinct colored blobs without convincing images; 8.10% of final step-20 values lie outside [-1,1]. Thus the denoising phase improves reconstruction, but has not established stable iterative generation.
+
+Runtime: 384.9 seconds. First-to-final epoch training MSE: 0.0910105 -> 0.0463708. Dataset-mean predictor MSE on the held-out subset: 0.2432772.
+
+| Replaced fraction | Input MSE | One-pass MSE | One-pass replaced-pixel MSE | One-pass retained-pixel MSE | Step-20 MSE |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0.0000000 | 0.0049962 | — | 0.0049962 | 0.4277414 |
+| 0.2 | 0.0972835 | 0.0119895 | 0.0260853 | 0.0084827 | 0.4108167 |
+| 0.5 | 0.2454160 | 0.0283627 | 0.0371824 | 0.0195323 | 0.4248448 |
+| 0.8 | 0.3916265 | 0.0714936 | 0.0767795 | 0.0502992 | 0.4220537 |
+| 0.95 | 0.4652617 | 0.1627876 | 0.1649308 | 0.1227261 | 0.4923177 |
+| 1 | 0.4900265 | 0.2642892 | 0.2642892 | — | 0.5479699 |
+
+| Histogram-start step | Across-sample pixel SD | MSE to dataset mean | Fraction outside [-1,1] |
+| --- | --- | --- | --- |
+| 0 | 0.4917553 | 0.2482129 | 0.0000000 |
+| 1 | 0.1290122 | 0.0270869 | 0.0000000 |
+| 2 | 0.1359090 | 0.0300529 | 0.0000000 |
+| 5 | 0.1661638 | 0.0442544 | 0.0000000 |
+| 10 | 0.2592630 | 0.0978785 | 0.0146891 |
+| 20 | 0.4176683 | 0.2859403 | 0.0810191 |
+
+**Validation:** every image index visited exactly once each epoch; 7,820 finite logged updates; final optimizer counters equal 7,820; saved source hash verified. Three targeted unit tests and S006 smoke run passed. Code review confirmed hidden corruption metadata, shared RGB masks, and evaluation RNG isolation. PNGs clip values for display, raw metrics/tensors do not. No FID computed.
+
+**Reproduce:**
+
+```sh
+uv run train_denoising.py --device mps --output runs/denoising-repeat
+uv run python test_denoising.py
+```
+
+**Saved evidence:** [config](runs/cifar10-denoising/config.json), [summary](runs/cifar10-denoising/summary.json), [training log](runs/cifar10-denoising/training.csv), [generation evaluations](runs/cifar10-denoising/evaluation.jsonl), [denoising evaluations](runs/cifar10-denoising/denoising_evaluation.jsonl), [held-out denoising](runs/cifar10-denoising/denoising_epoch_20.png), [generation rollout](runs/cifar10-denoising/trajectory_final.png), [final checkpoint](runs/cifar10-denoising/checkpoint_epoch_20.pt), [source](runs/cifar10-denoising/train_denoising.py).
+
 ## Smoke runs
 
 These validate mechanics before full training; their sample quality is not treated as experimental evidence.
@@ -232,6 +275,8 @@ These validate mechanics before full training; their sample quality is not treat
 **S004:** continue E003 on 256 images, 20 transitions each, 40 updates; 2.71 seconds. Exact initial output match and Adam counters advancing from 7,820 to 7,860 verified. First launch failed before training because older checkpoints stored TorchVersion metadata; loader allowlists this type and the rerun passed. [Config](runs/rollout-finetune-smoke/config.json), [summary](runs/rollout-finetune-smoke/summary.json).
 
 **S005:** 256 training images, full-dataset initialization histograms, 20 transitions, 40 updates; 7.00 seconds. Three tests cover histogram/quantization correctness, categorical sampling frequencies, and detached sampled state carry with optimizer updates. [Config](runs/categorical-smoke/config.json), [summary](runs/categorical-smoke/summary.json).
+
+**S006:** 256 training images, three shuffled epochs, six updates; 3.16 seconds. Three targeted tests verify corruption endpoints/RGB-shared masks, single-update target-dependent inputs, and separate masked metrics. [Summary](runs/denoising-smoke/summary.json), [config](runs/denoising-smoke/config.json).
 
 ## Adding a run
 

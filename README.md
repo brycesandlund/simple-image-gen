@@ -87,3 +87,12 @@ uv run python test_categorical.py
 ```
 
 Predict 200 bins per RGB channel, train with cross-entropy against the same target throughout 20 recurrent steps, and feed independently sampled categorical outputs into the next step. Initialization samples the full dataset's per-position/channel histograms. Temperature is 1; choices are detached and sampled from pre-update logits. E005 in `training_runs.md` records the result and comparison with independent histogram samples.
+
+## Continuous denoising pretraining
+
+```sh
+uv run train_denoising.py --device mps --output runs/denoising-repeat
+uv run python test_denoising.py
+```
+
+E006 trains continuous RGB MSE for 20 shuffled epochs, one update per minibatch. Each image is freshly corrupted by replacing random whole RGB pixels with independent per-position/channel empirical colors; the replacement rate is uniform from zero to one. No corruption level or mask is supplied to the model. Evaluation includes held-out one-pass denoising, repeated frozen rollouts, and histogram-start generation. See `training_runs.md` for measured results and limitations.
